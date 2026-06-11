@@ -1,11 +1,12 @@
 import streamlit as st
 import json, re
 from datetime import datetime
+from collections import Counter
 import urllib.request, urllib.parse, urllib.error
 
 YOUTUBE_API_KEY = st.secrets["YOUTUBE_API_KEY"]
 
-st.set_page_config(page_title="YouTube ツール", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="YouTube 動画分析ツール", page_icon="🎬", layout="wide")
 
 st.markdown("""
 <style>
@@ -14,15 +15,21 @@ st.markdown("""
 .impr-box { background:#fffbeb; border-left:3px solid #f59e0b; border-radius:0 8px 8px 0; padding:10px 14px; margin:6px 0; font-size:13px; line-height:1.7; color:#1a1a1a !important; }
 .critical-box { background:#fff1f2; border-left:3px solid #f43f5e; border-radius:0 8px 8px 0; padding:10px 14px; margin:6px 0; font-size:13px; line-height:1.7; color:#1a1a1a !important; }
 .buzz-banner { background:linear-gradient(90deg,#fef3c7,#fde68a); border:1px solid #f59e0b; border-radius:10px; padding:12px 18px; margin:8px 0; font-size:14px; font-weight:700; color:#92400e; }
+.win-box { background:#ecfdf5; border:1px solid #10b981; border-radius:10px; padding:10px 16px; margin:6px 0; font-size:13px; color:#065f46; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════════
-# YouTube API
+# YouTube API（クォータカウンター付き）
 # ════════════════════════════════════════════════════════
 
 def yt_api(endpoint, params):
+    cost = 100 if endpoint == 'search' else 1
+    try:
+        st.session_state['quota_used'] = st.session_state.get('quota_used', 0) + cost
+    except Exception:
+        pass
     params['key'] = YOUTUBE_API_KEY
     url = "https://www.googleapis.com/youtube/v3/" + endpoint + "?" + urllib.parse.urlencode(params)
     with urllib.request.urlopen(url) as r:
@@ -43,6 +50,8 @@ def _median(lst):
     if n == 0: return 0
     return s[n//2] if n % 2 else (s[n//2 - 1] + s[n//2]) / 2
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_video(video_id):
     from datetime import timezone
     d = yt_api('videos', {'part': 'snippet,statistics,contentDetails', 'id': video_id})
@@ -86,6 +95,8 @@ def fetch_video(video_id):
         'total_channel_videos': int(ch_stats.get('videoCount', 0)),
     }
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_channel_benchmark(channel_id, exclude_id, max_results=25):
     """チャンネルの直近動画からベンチマーク統計を計算（外れ値に強い中央値ベース）"""
     from datetime import timezone
@@ -135,6 +146,120 @@ def fetch_channel_benchmark(channel_id, exclude_id, max_results=25):
     except Exception:
         return None
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_comments(video_id, max_results=50):
+    """上位コメントを取得（コメント無効の動画はNone）"""
+    try:
+        d = yt_api('commentThreads', {
+            'part': 'snippet', 'videoId': video_id,
+            'maxResults': max_results, 'order': 'relevance',
+            'textFormat': 'plainText'
+        })
+        out = []
+        for item in d.get('items', []):
+            c = item['snippet']['topLevelComment']['snippet']
+            out.append({
+                'text': c.get('textDisplay', ''),
+                'likes': int(c.get('likeCount', 0)),
+                'author': c.get('authorDisplayName', ''),
+            })
+        return out
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_channel(s):
+    """チャンネルURL・@ハンドル・動画URLからチャンネルIDと基本情報を取得"""
+    try:
+        m = re.search(r'channel/(UC[\w-]{22})', s)
+        if m:
+            cid = m.group(1)
+            d = yt_api('channels', {'part': 'snippet,statistics', 'id': cid})
+        else:
+            vid = extract_video_id(s)
+            if vid:
+                vd = yt_api('videos', {'part': 'snippet', 'id': vid})
+                if not vd.get('items'): return None
+                cid = vd['items'][0]['snippet']['channelId']
+                d = yt_api('channels', {'part': 'snippet,statistics', 'id': cid})
+            else:
+                m = re.search(r'@([\w.\-ぁ-んァ-ヶ一-龥ー]+)', s)
+                if not m: return None
+                d = yt_api('channels', {'part': 'snippet,statistics', 'forHandle': '@' + m.group(1)})
+        if not d.get('items'): return None
+        c = d['items'][0]
+        return {
+            'id': c['id'],
+            'title': c['snippet']['title'],
+            'subscribers': int(c.get('statistics', {}).get('subscriberCount', 0)),
+            'total_videos': int(c.get('statistics', {}).get('videoCount', 0)),
+            'total_views': int(c.get('statistics', {}).get('viewCount', 0)),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_channel_videos(channel_id, max_results=25):
+    """チャンネル分析用：直近動画の詳細リスト"""
+    from datetime import timezone
+    try:
+        search_data = yt_api('search', {
+            'part': 'id', 'channelId': channel_id,
+            'order': 'date', 'type': 'video', 'maxResults': max_results
+        })
+        ids = [i['id']['videoId'] for i in search_data.get('items', []) if i['id'].get('videoId')]
+        if not ids: return []
+        vdata = yt_api('videos', {'part': 'snippet,statistics,contentDetails', 'id': ','.join(ids[:25])})
+        now = datetime.now(timezone.utc)
+        out = []
+        for item in vdata.get('items', []):
+            sn = item['snippet']; st_ = item.get('statistics', {})
+            views = int(st_.get('viewCount', 0))
+            likes = int(st_.get('likeCount', 0))
+            pub_date = datetime.strptime(sn['publishedAt'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            days = max(1, min(365, (now - pub_date).days))
+            out.append({
+                'id': item['id'],
+                'title': sn['title'],
+                'views': views,
+                'likes': likes,
+                'comments': int(st_.get('commentCount', 0)),
+                'lr': likes / views * 100 if views > 0 else 0,
+                'vpd': views / days,
+                'days': (now - pub_date).days,
+                'duration': parse_duration(item['contentDetails']['duration']),
+                'hour_jst': (pub_date.hour + 9) % 24,
+                'weekday': pub_date.weekday(),
+                'published': sn['publishedAt'][:10],
+            })
+        return out
+    except Exception:
+        return []
+
+
+# ════════════════════════════════════════════════════════
+# 感情・タイトル判定の共通正規表現
+# ════════════════════════════════════════════════════════
+
+RE_EMO_SURPRISE = r'衝撃|驚き|まさか|信じられない|ヤバい|ヤバすぎ|えっ|実は|知らなかった|まじ|ガチ|本気'
+RE_EMO_FEAR     = r'危険|NG|やってはいけない|失敗|後悔|損する|終わる|最悪|注意|警告|闇|怖'
+RE_EMO_DESIRE   = r'稼げる|モテる|痩せる|お金|自由|成功|夢|理想|最強|無敵|すごい|神|爆伸び|億'
+RE_EMO_EMPATHY  = r'あるある|わかる|共感|みんな|あなたも|こんな人|こんな経験|だけど|なのに'
+RE_CURIOSITY    = r'理由|なぜ|実は|意外|本当に|本当は|したら.*だった|結果|真実|秘密|裏技|知られていない|実際|ぶっちゃけ|どうなる|検証'
+RE_TARGET       = r'初心者|入門|上級|プロ|副業|社会人|学生|ビジネス|主婦|子ども|子供|シニア'
+
+def emotional_count_of(title):
+    return sum([
+        bool(re.search(RE_EMO_SURPRISE, title)),
+        bool(re.search(RE_EMO_FEAR, title)),
+        bool(re.search(RE_EMO_DESIRE, title)),
+        bool(re.search(RE_EMO_EMPATHY, title)),
+    ])
+
+
 # ════════════════════════════════════════════════════════
 # 分析エンジン
 # ════════════════════════════════════════════════════════
@@ -167,7 +292,6 @@ def analyze(v, bench=None):
     # ────────────────────────────────
     # 実績証明済み判定（結果が正義）
     # ────────────────────────────────
-    # バズっている動画はメタデータの粗より実績を優先して評価する
     buzz_label = None
     if views >= 1_000_000:
         is_proven = True
@@ -189,7 +313,6 @@ def analyze(v, bench=None):
     # ────────────────────────────────
     perf = 0.0
 
-    # ① 絶対再生数（対数スケール）── 0〜4点
     if views >= 5_000_000:
         perf += 4.0; good.append(f"再生数{views:,}回 → 全YouTubeでもトップ層の実績")
     elif views >= 1_000_000:
@@ -206,7 +329,6 @@ def analyze(v, bench=None):
         perf += 0.3
         bad.append(f"再生数がまだ少ない（{views:,}回）→ まずは露出を増やす段階")
 
-    # ② チャンネル中央値との比較 ── 0〜3点
     if ch_ratio is not None:
         if ch_ratio >= 5:
             perf += 3.0; good.append(f"チャンネル中央値の{ch_ratio:.1f}倍 → チャンネル史上級のバズ")
@@ -222,9 +344,8 @@ def analyze(v, bench=None):
             bad.append(f"チャンネル中央値を大きく下回る（{ch_ratio:.1f}倍）→ テーマかパッケージの見直しを")
             impr.append("【確認方法】YouTube Studio → アナリティクス → コンテンツ → 上位動画とこの動画のテーマ・タイトル型・サムネイルを比較し、当たっている型に寄せる")
     else:
-        perf += 1.5  # ベンチマーク取得不可時は中立
+        perf += 1.5
 
-    # ③ 登録者比 ── 0〜3点
     if subs > 0 and views > 0:
         vr_ratio = views / subs
         if vr_ratio >= 3:
@@ -253,7 +374,6 @@ def analyze(v, bench=None):
         bad.append(f"タイトルが長すぎる（{tlen}文字）→ スマホでは40文字超えで見切れる")
         impr.append(f"【変更場所】YouTube Studio → コンテンツ → 該当動画 → 詳細タブ → タイトル欄。現在{tlen}文字を60文字以内に短縮する。伝えたいことを1つに絞り、残りは概要欄の1行目に移す")
     elif tlen < 20:
-        # バズ動画は短く強いタイトルも多い。実績がある場合は減点を緩和
         if is_proven:
             ts -= 1
             good.append(f"短いタイトル（{tlen}文字）だが実績が出ている → 強いワード選びができている")
@@ -281,7 +401,7 @@ def analyze(v, bench=None):
     has_howto    = bool(re.search(r'方法|やり方|手順|仕方|コツ|ポイント|テクニック|ワザ', title))
     has_benefit  = bool(re.search(r'できる|わかる|なる|増える|減る|上がる|下がる|解決|改善|最速|完全', title))
     has_urgency  = bool(re.search(r'知らないと|損する|必見|絶対|今すぐ|要注意|危険|NG|やばい', title))
-    has_target   = bool(re.search(r'初心者|入門|ゼロから|基礎|基本|上級|プロ|ビジネス|副業|社会人|学生', title))
+    has_target   = bool(re.search(RE_TARGET, title))
     has_question = bool(re.search(r'[？?]|なぜ|どうして|どうやって', title))
     hook_count   = sum([has_bracket, has_howto, has_benefit, has_urgency, has_target, has_question])
 
@@ -404,9 +524,8 @@ def analyze(v, bench=None):
     scores['概要欄'] = max(1, ds)
 
     # ────────────────────────────────
-    # 4. タグ
+    # 4. タグ（現代のYouTubeでは影響小のため減点控えめ）
     # ────────────────────────────────
-    # 注：現在のYouTubeではタグの影響は小さい。大物チャンネルはタグ無しも多いため減点は控えめに
     tg = 10
     tc = len(tags)
     if tc == 0:
@@ -431,7 +550,6 @@ def analyze(v, bench=None):
         first_tag = tags[0]
         if len(first_tag) >= 3 and re.search(r'[ァ-ヶー一-龥a-zA-Z]', first_tag):
             good.append(f"最初のタグが検索キーワード（{first_tag}）→ 最重要タグを先頭に置くのは正解")
-
         long_tail = [t for t in tags if (' ' in t and len(t) >= 8) or len(t) >= 12]
         if len(long_tail) >= 3:
             good.append(f"ロングテールキーワードタグがある（{len(long_tail)}個）→ 競合少ない検索でヒットしやすい")
@@ -439,10 +557,8 @@ def analyze(v, bench=None):
     scores['タグ'] = max(1, tg)
 
     # ────────────────────────────────
-    # 5. エンゲージメント（チャンネル規模別の基準で評価）
+    # 5. エンゲージメント（チャンネル規模別の基準）
     # ────────────────────────────────
-    # 登録者が多いほどライト視聴者が増え、いいね率は構造的に下がる。
-    # 規模に応じた現実的な基準値で判定する
     if subs >= 1_000_000:
         t_great, t_good, t_ok, t_low = 4.0, 2.0, 1.0, 0.3
     elif subs >= 100_000:
@@ -516,7 +632,6 @@ def analyze(v, bench=None):
         bad.append("投稿直後のため視聴ペースの評価は参考程度")
         ps = 7
     elif is_proven and views >= 100_000:
-        # 実績証明済みの大ヒット動画はペースで減点しない（古い動画ほどvpdは下がるため）
         good.append(f"累計{views:,}再生の実績 → 視聴ペースの細かい増減より総量が物語っている")
     else:
         vpd_str = f"{vpd:.0f}回/日"
@@ -635,16 +750,16 @@ def analyze(v, bench=None):
     else:
         tms -= 1
 
-    if weekday in [1, 2, 3]:  # 火〜木
+    if weekday in [1, 2, 3]:
         good.append(f"投稿曜日が最適（{wd_name}曜日）→ 週の中盤は競合が少なく埋もれにくい")
-    elif weekday in [0, 4]:  # 月・金
+    elif weekday in [0, 4]:
         good.append(f"投稿曜日が良好（{wd_name}曜日）")
-    elif weekday == 5:  # 土
+    elif weekday == 5:
         tms -= 1
         if not is_proven:
             bad.append("土曜日投稿 → 週末は視聴数は多いが通知が埋もれやすい")
             impr.append("【変更場所（次回から）】YouTube Studio → アップロード → 「スケジュール」で火〜木曜の19〜21時を指定して予約投稿する。土日はアクティブユーザーが多いが大手チャンネルの投稿も増えるため通知が埋もれやすい")
-    else:  # 日
+    else:
         tms -= 2
         if not is_proven:
             bad.append("日曜日投稿 → 月曜朝に通知が大量のメールに埋もれる")
@@ -684,7 +799,7 @@ def analyze(v, bench=None):
     # ────────────────────────────────
     tgt = 10
 
-    has_target_word = bool(re.search(r'初心者|入門|上級|プロ|副業|社会人|学生|ビジネス|主婦|子ども|子供|シニア', title))
+    has_target_word = bool(re.search(RE_TARGET, title))
     has_pain        = bool(re.search(r'できない|わからない|困って|解決|悩み|問題|失敗|NG|難しい|苦手', title + desc[:200]))
     has_desire      = bool(re.search(r'稼ぐ|増やす|早く|楽に|自動|効率|時短|節約|簡単|すごい|驚き', title + desc[:200]))
     has_value_prop  = bool(re.search(r'分で|ステップ|方法|コツ|ポイント|解説|やり方|手順|完全|徹底', title))
@@ -756,13 +871,7 @@ def analyze(v, bench=None):
     # 12. バズ・バイラル適合度
     # ────────────────────────────────
     bz = 10
-
-    # 感情トリガー（見た瞬間に感情が動くか）
-    emotional_surprise = bool(re.search(r'衝撃|驚き|まさか|信じられない|ヤバい|ヤバすぎ|えっ|実は|知らなかった|まじ|ガチ|本気', title))
-    emotional_fear     = bool(re.search(r'危険|NG|やってはいけない|失敗|後悔|損する|終わる|最悪|注意|警告|闇|怖', title))
-    emotional_desire   = bool(re.search(r'稼げる|モテる|痩せる|お金|自由|成功|夢|理想|最強|無敵|すごい|神|爆伸び|億', title))
-    emotional_empathy  = bool(re.search(r'あるある|わかる|共感|みんな|あなたも|こんな人|こんな経験|だけど|なのに', title))
-    emotional_count    = sum([emotional_surprise, emotional_fear, emotional_desire, emotional_empathy])
+    emotional_count = emotional_count_of(title)
 
     if emotional_count >= 2:
         good.append(f"タイトルに感情トリガーが{emotional_count}種類ある → 見た瞬間に感情が動きクリックされやすい")
@@ -779,8 +888,7 @@ def analyze(v, bench=None):
             critical.append("感情トリガーが0 → タイトルを見て感情が動かないためクリックされにくい。大きな改善ポイント")
             impr.append("【変更場所】YouTube Studio → コンテンツ → タイトル欄。今すぐ感情ワードを入れる：①「まさか〇〇が…衝撃の結果」②「〇〇してはいけない3つの理由」③「〇〇するだけで結果が変わる方法」④「〇〇あるある！共感した人いいねして」")
 
-    # 情報ギャップ（続きが気になる構造があるか）
-    curiosity_gap = bool(re.search(r'理由|なぜ|実は|意外|本当に|本当は|したら.*だった|結果|真実|秘密|裏技|知られていない|実際|ぶっちゃけ|どうなる|検証', title))
+    curiosity_gap = bool(re.search(RE_CURIOSITY, title))
     if curiosity_gap:
         good.append("タイトルに「情報ギャップ」がある → 答えを知りたくてクリックされる構造")
     else:
@@ -789,7 +897,6 @@ def analyze(v, bench=None):
             bad.append("「続きが気になる」構造がない → 「見なくていいか」と思われてしまう")
             impr.append("【変更場所】YouTube Studio → コンテンツ → タイトル欄。情報ギャップパターン：「〇〇した結果→まさかの展開」「実は〇〇には理由があった」「〇〇を続けた3ヶ月後…」のように答えを見たいと思わせる構造にする")
 
-    # シェア・保存動機（誰かに見せたくなるか）
     shareable = bool(re.search(r'保存版|完全版|永久保存|決定版|初公開|最安|無料|タダ|禁断|裏技|非公開|世界一|日本一|限定', title + desc[:100]))
     if shareable:
         good.append("「保存・シェアしたくなる」要素がある → 拡散されやすい")
@@ -799,7 +906,6 @@ def analyze(v, bench=None):
             bad.append("「誰かに見せたくなる」要素が弱い → 自然な拡散が起きにくい")
             impr.append("【変更場所】YouTube Studio → タイトル欄か説明欄の冒頭。「保存版」「完全版」「永久保存版」などを入れると「あとで見返したい・シェアしたい」という気持ちが生まれる")
 
-    # チャンネル中央値との比較でテーマの適性確認
     if bench:
         avg_v = bench['avg_views']
         if avg_v > 0:
@@ -898,7 +1004,6 @@ def analyze(v, bench=None):
     total = round(sum(scores[k] * weights[k] for k in scores) / sum(weights.values()) * 10)
 
     # 実績証明済みオーバーライド（結果が正義）
-    # どれだけメタデータが粗くても、実際に伸びた動画は高評価が正しい
     if views >= 1_000_000:
         total = max(total, 88)
     elif views >= 100_000 and (ch_ratio is None or ch_ratio >= 1.0):
@@ -909,7 +1014,6 @@ def analyze(v, bench=None):
         total = max(total, 70)
     total = min(total, 100)
 
-    # 実績証明済みの場合、緊急問題は「伸びしろ」に降格（実績が反証になっているため）
     if is_proven and critical:
         bad = critical + bad
         critical = []
@@ -922,12 +1026,11 @@ def analyze(v, bench=None):
     perf_score = round(sum(scores[k] * perf_w[k] for k in perf_keys) / sum(perf_w.values()) * 10)
     pack_score = round(sum(scores[k] * pack_w[k] for k in pack_keys) / sum(pack_w.values()) * 10)
 
-    # ── 改善アクション重複排除：同じ変更場所は先着1〜2件に絞る ──
+    # ── 改善アクション重複排除 ──
     _seen = {}
     _deduped = []
     for _item in impr:
         if 'タイトル欄' in _item:
-            # タイトルは最重要2件まで（構造的問題 + フック/感情の2軸）
             _n = _seen.get('title', 0)
             if _n < 2:
                 _seen['title'] = _n + 1
@@ -977,62 +1080,162 @@ def grade_of(total):
 
 
 # ════════════════════════════════════════════════════════
-# サイドバー
+# タイトルシミュレーター
 # ════════════════════════════════════════════════════════
 
-with st.sidebar:
-    st.title("🎬 YouTube 動画分析")
-    st.caption("v2.0 — 実績重視スコアリング")
-    st.markdown("""
-**スコアの考え方**
-- 🔥 実際に伸びた動画は高評価（結果が正義）
-- 📦 パッケージ（タイトル・サムネ等）は伸びしろとして提示
-- 📊 チャンネル中央値・登録者規模を考慮した相対評価
-""")
+def evaluate_title_draft(title):
+    """タイトル案を即採点（10点満点＋チェックリスト）"""
+    checks = []
+    score = 0.0
+    tlen = len(title)
+
+    ok_len = 30 <= tlen <= 60
+    checks.append((ok_len, f"文字数 {tlen}文字（推奨：30〜60文字）"))
+    score += 2.0 if ok_len else (1.0 if 20 <= tlen <= 70 else 0)
+
+    has_num = bool(re.search(r'\d', title))
+    checks.append((has_num, "数字が入っている（CTR +38%）"))
+    score += 1.5 if has_num else 0
+
+    emo = emotional_count_of(title)
+    checks.append((emo >= 2, f"感情トリガー {emo}種類（推奨：2種類以上）"))
+    score += min(2.0, emo * 1.0)
+
+    cur = bool(re.search(RE_CURIOSITY, title))
+    checks.append((cur, "情報ギャップ（続きが気になる構造）"))
+    score += 1.5 if cur else 0
+
+    tgt = bool(re.search(RE_TARGET, title))
+    checks.append((tgt, "ターゲット（誰向けか）の明示"))
+    score += 1.0 if tgt else 0
+
+    hooks = sum([
+        bool(re.search(r'【.*?】|「.*?」|\[.*?\]', title)),
+        bool(re.search(r'方法|やり方|手順|仕方|コツ|ポイント|テクニック|ワザ', title)),
+        bool(re.search(r'できる|わかる|なる|増える|減る|上がる|下がる|解決|改善|最速|完全', title)),
+        bool(re.search(r'知らないと|損する|必見|絶対|今すぐ|要注意|危険|NG|やばい', title)),
+        bool(re.search(r'[？?]|なぜ|どうして|どうやって', title)),
+    ])
+    checks.append((hooks >= 2, f"クリック誘引フック {hooks}種類（推奨：2種類以上）"))
+    score += min(1.5, hooks * 0.75)
+
+    nouns = re.findall(r'[ァ-ヶー]{3,}|[一-龥]{3,}|[a-zA-Z]{4,}', title)
+    kw_front = bool(nouns) and title.find(nouns[0]) < max(1, len(title) // 2)
+    checks.append((kw_front, "検索キーワードが前半にある"))
+    score += 0.5 if kw_front else 0
+
+    return min(10, round(score, 1)), checks
+
+
+def suggest_tags(title):
+    """タイトルから推奨タグを自動生成"""
+    nouns = re.findall(r'[ァ-ヶー]{3,}|[一-龥]{2,}|[a-zA-Z]{3,}', title)
+    seen = set(); base = []
+    for n in nouns:
+        if n not in seen and not re.match(r'^(方法|やり方|理由|結果|解説|完全|初心者|入門)$', n):
+            seen.add(n); base.append(n)
+        if len(base) >= 3: break
+    if not base:
+        return []
+    tags = list(base)
+    suffixes = ['使い方', 'やり方', '解説', '初心者', '入門', 'コツ', 'おすすめ']
+    for s in suffixes[:5]:
+        tags.append(f"{base[0]} {s}")
+    if len(base) >= 2:
+        tags.append(f"{base[0]} {base[1]}")
+        tags.append(f"{base[1]} 使い方")
+    return tags[:15]
+
 
 # ════════════════════════════════════════════════════════
-# 動画分析
+# コメント感情分析
 # ════════════════════════════════════════════════════════
 
-st.title("📊 動画分析")
-st.caption("URLを貼ると動画を実績×パッケージの2軸で採点します。")
+RE_POS = r'神|最高|すごい|凄い|面白|おもしろ|勉強にな|助かり|ありがと|分かりやすい|わかりやすい|好き|笑った|参考にな|感動|納得|嬉しい|期待|応援|楽しい|良かった|よかった'
+RE_NEG = r'つまらな|微妙|分かりにく|わかりにく|長すぎ|うるさ|嫌い|残念|ひどい|最悪|意味不明|飽き|違う|嘘|うそ'
 
-url = st.text_input("YouTube動画のURLを入力", placeholder="https://www.youtube.com/watch?v=...",
-                    key="analysis_url")
+STOPWORDS = {'これ', 'それ', 'あれ', 'ここ', 'そこ', 'こと', 'もの', 'ため', 'よう', 'さん', 'です', 'ます', 'した', 'する', 'いる', 'ある', 'ない', 'なる', 'れる', 'られ', 'って', 'けど', 'から', 'まで', 'など', 'とき', '動画', '自分', '本当', '今回'}
 
-if url:
-    vid_id = extract_video_id(url)
-    if not vid_id:
-        st.error("URLからビデオIDを取得できませんでした。")
-        st.stop()
+def analyze_comments(comments):
+    pos, neg, neu = 0, 0, 0
+    words = Counter()
+    for c in comments:
+        t = c['text']
+        p = bool(re.search(RE_POS, t))
+        n = bool(re.search(RE_NEG, t))
+        if p and not n: pos += 1
+        elif n and not p: neg += 1
+        else: neu += 1
+        for w in re.findall(r'[ァ-ヶー]{2,}|[一-龥]{2,}', t):
+            if w not in STOPWORDS:
+                words[w] += 1
+    total = len(comments)
+    return {
+        'pos': pos, 'neg': neg, 'neu': neu, 'total': total,
+        'pos_rate': pos / total * 100 if total else 0,
+        'neg_rate': neg / total * 100 if total else 0,
+        'top_words': words.most_common(10),
+        'top_comments': sorted(comments, key=lambda c: -c['likes'])[:5],
+    }
 
-    if st.session_state.get('analysis_last_url') != url:
-        with st.spinner("動画データ取得中..."):
-            try:
-                v = fetch_video(vid_id)
-                if not v:
-                    st.error("動画が見つかりません。")
-                    st.stop()
-            except urllib.error.HTTPError as e:
-                if e.code == 403:
-                    st.error("APIクォータの上限に達した可能性があります。明日また試してください。")
-                else:
-                    st.error(f"APIエラー: {e}")
-                st.stop()
-            except Exception as e:
-                st.error(f"エラー: {e}"); st.stop()
-        with st.spinner("チャンネルベンチマーク取得中..."):
-            bench = fetch_channel_benchmark(v['channel_id'], vid_id)
-        with st.spinner("分析中..."):
-            result = analyze(v, bench)
-            st.session_state.av = v
-            st.session_state.aresult = result
-            st.session_state.analysis_last_url = url
 
-    v      = st.session_state.av
-    result = st.session_state.aresult
-    bench  = result.get('bench')
+# ════════════════════════════════════════════════════════
+# 30日予測・レポート
+# ════════════════════════════════════════════════════════
 
+def project_views(views, vpd, days):
+    """簡易的な30日後再生数予測（経過日数による減衰込み）"""
+    if days < 7:    decay = 1.1
+    elif days < 30: decay = 0.9
+    elif days < 90: decay = 0.7
+    else:           decay = 0.4
+    return int(views + vpd * 30 * decay)
+
+
+def build_report_md(v, result):
+    g, _ = grade_of(result['total'])
+    lines = [
+        "# YouTube動画分析レポート",
+        "",
+        f"**動画：** {v['title']}",
+        f"**チャンネル：** {v['channel_title']}（登録者{v['subscribers']:,}人）",
+        f"**URL：** https://www.youtube.com/watch?v={v['id']}",
+        f"**分析日：** {datetime.now().strftime('%Y-%m-%d')}",
+        "",
+        f"## 総合スコア：{result['total']}点（グレード{g}）",
+        f"- 実績スコア：{result['perf_score']}点",
+        f"- パッケージスコア：{result['pack_score']}点",
+        f"- 再生数：{v['views']:,}回 / いいね率：{result['like_rate']:.1f}% / コメント率：{result['comment_rate']:.2f}%",
+        "",
+        "## 項目別スコア",
+    ]
+    for k, s in result['scores'].items():
+        lines.append(f"- {k}: {s}/10")
+    if result['critical']:
+        lines.append("\n## 🚨 緊急で直すべき問題")
+        for c in result['critical']:
+            lines.append(f"- {c}")
+    if result['good']:
+        lines.append("\n## ✅ 良い点")
+        for x in result['good']:
+            lines.append(f"- {x}")
+    if result['bad']:
+        lines.append("\n## ⚠️ 改善できる点")
+        for x in result['bad']:
+            lines.append(f"- {x}")
+    if result['impr']:
+        lines.append("\n## 💡 改善アクション（優先順）")
+        for i, x in enumerate(result['impr'], 1):
+            lines.append(f"{i}. {x}")
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════
+# 共通UI：分析結果の表示
+# ════════════════════════════════════════════════════════
+
+def render_analysis(v, result):
+    bench = result.get('bench')
     c1, c2 = st.columns([1, 2])
     with c1:
         if v['thumbnail_url']:
@@ -1058,6 +1261,9 @@ if url:
         m3.metric("いいね率", f"{result['like_rate']:.1f}%")
         m4.metric("コメント率", f"{result['comment_rate']:.2f}%")
         m5.metric("投稿", f"{v['days_since']}日前")
+
+        proj = project_views(v['views'], result['views_per_day'], v['days_since'])
+        st.caption(f"📈 30日後の予測再生数：約 {proj:,} 回（現在のペースから簡易予測）")
 
         if bench:
             st.caption(f"📊 チャンネル中央値（直近{bench['sample']}本）: "
@@ -1104,7 +1310,6 @@ if url:
 
     st.divider()
 
-    # ─── バズる動画の共通パターンチェック ──────────────────
     if result.get('patterns'):
         st.subheader("🔍 バズる動画の共通パターン チェック")
         patterns = result['patterns']
@@ -1144,3 +1349,299 @@ if url:
                     f"<span style='font-size:11px; color:#dc2626; margin-left:20px;'>{p['detail']} ── {p['why']}</span>"
                     f"{fix_html}</div>",
                     unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════
+# サイドバー
+# ════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.title("🎬 YouTube 動画分析")
+    st.caption("v3.0 — フル機能版")
+    st.markdown("""
+**スコアの考え方**
+- 🔥 実際に伸びた動画は高評価（結果が正義）
+- 📦 パッケージは伸びしろとして提示
+- 📊 チャンネル中央値・登録者規模を考慮
+
+**機能**
+- 📊 動画分析（採点＋改善アクション）
+- ⚔️ 2本比較（自分 vs バズ動画）
+- 📺 チャンネル分析（勝ちパターン抽出）
+- 💬 コメント感情分析
+- ✍️ タイトルシミュレーター
+- 🏷️ タグ自動提案
+- 📄 レポートDL
+""")
+    quota = st.session_state.get('quota_used', 0)
+    st.divider()
+    st.caption(f"⚡ このセッションのAPI使用量：約{quota:,} / 10,000ユニット")
+    st.caption("※同じURLの再分析は1時間キャッシュされノーコスト")
+
+
+# ════════════════════════════════════════════════════════
+# メイン：3つのタブ
+# ════════════════════════════════════════════════════════
+
+tab1, tab2, tab3 = st.tabs(["📊 動画分析", "⚔️ 2本比較", "📺 チャンネル分析"])
+
+# ────────────────────────────────────────────────────────
+# タブ1：動画分析
+# ────────────────────────────────────────────────────────
+with tab1:
+    st.title("📊 動画分析")
+    st.caption("URLを貼ると動画を実績×パッケージの2軸で採点します。")
+
+    url = st.text_input("YouTube動画のURLを入力", placeholder="https://www.youtube.com/watch?v=...",
+                        key="analysis_url")
+
+    if url:
+        vid_id = extract_video_id(url)
+        if not vid_id:
+            st.error("URLからビデオIDを取得できませんでした。")
+            st.stop()
+
+        with st.spinner("動画データ取得中..."):
+            try:
+                v = fetch_video(vid_id)
+                if not v:
+                    st.error("動画が見つかりません。")
+                    st.stop()
+            except urllib.error.HTTPError as e:
+                if e.code == 403:
+                    st.error("APIクォータの上限に達した可能性があります。明日また試してください。")
+                else:
+                    st.error(f"APIエラー: {e}")
+                st.stop()
+            except Exception as e:
+                st.error(f"エラー: {e}"); st.stop()
+        with st.spinner("チャンネルベンチマーク取得中..."):
+            bench = fetch_channel_benchmark(v['channel_id'], vid_id)
+        result = analyze(v, bench)
+
+        render_analysis(v, result)
+
+        st.divider()
+
+        # ─── レポートダウンロード ───
+        report_md = build_report_md(v, result)
+        st.download_button("📄 分析レポートをダウンロード（Markdown）", report_md,
+                           file_name=f"yt_report_{vid_id}.md", mime="text/markdown")
+
+        # ─── コメント感情分析 ───
+        with st.expander("💬 コメント感情分析（クリックで開く）"):
+            if st.button("コメントを分析する", key="cmt_btn"):
+                with st.spinner("コメント取得中..."):
+                    comments = fetch_comments(vid_id)
+                if comments is None:
+                    st.info("コメントが無効化されているか取得できませんでした。")
+                elif not comments:
+                    st.info("コメントがまだありません。")
+                else:
+                    ca = analyze_comments(comments)
+                    cc1, cc2, cc3 = st.columns(3)
+                    cc1.metric("😊 ポジティブ", f"{ca['pos']}件（{ca['pos_rate']:.0f}%）")
+                    cc2.metric("😞 ネガティブ", f"{ca['neg']}件（{ca['neg_rate']:.0f}%）")
+                    cc3.metric("😐 中立", f"{ca['neu']}件")
+                    if ca['pos_rate'] >= 30 and ca['neg_rate'] <= 5:
+                        st.success("視聴者の反応は非常にポジティブ。このテーマ・スタイルは継続すべき")
+                    elif ca['neg_rate'] >= 20:
+                        st.error("ネガティブ反応が多め。コメントを読んで原因（内容・音質・テンポ等）を特定すべき")
+                    if ca['top_words']:
+                        st.markdown("**頻出ワード：** " + " / ".join(f"{w}({c})" for w, c in ca['top_words']))
+                    st.markdown("**👍 最も支持されたコメント：**")
+                    for c in ca['top_comments']:
+                        st.markdown(f"> {c['text'][:120]}{'…' if len(c['text'])>120 else ''}　`👍{c['likes']}`")
+
+        # ─── タイトルシミュレーター ───
+        with st.expander("✍️ タイトルシミュレーター（書き直し案を即採点）"):
+            cur_score, cur_checks = evaluate_title_draft(v['title'])
+            st.markdown(f"**現在のタイトル：** {v['title']}　→　**{cur_score}/10点**")
+            draft = st.text_input("新しいタイトル案を入力", key="title_draft",
+                                  placeholder="例：【初心者向け】〇〇を5分で自動化する3つの方法")
+            if draft:
+                new_score, new_checks = evaluate_title_draft(draft)
+                diff = new_score - cur_score
+                emoji = "🟢" if diff > 0 else ("🔴" if diff < 0 else "⚪")
+                st.markdown(f"### {emoji} 新案：**{new_score}/10点**（現在から{diff:+.1f}点）")
+                for ok, label in new_checks:
+                    st.markdown(f"{'✅' if ok else '❌'} {label}")
+
+        # ─── タグ自動提案 ───
+        with st.expander("🏷️ タグ自動提案（コピペで使える）"):
+            sugg = suggest_tags(v['title'])
+            if sugg:
+                st.markdown("タイトルから生成した推奨タグ（YouTube Studio → 詳細タブ → タグ欄にコピペ）：")
+                st.code(", ".join(sugg))
+            else:
+                st.info("タイトルからキーワードを抽出できませんでした。")
+
+# ────────────────────────────────────────────────────────
+# タブ2：2本比較
+# ────────────────────────────────────────────────────────
+with tab2:
+    st.title("⚔️ 2本比較")
+    st.caption("自分の動画とバズ動画を並べて、何が違うのかを比較します。")
+
+    cu1, cu2 = st.columns(2)
+    url_a = cu1.text_input("動画A（自分の動画など）", key="cmp_a", placeholder="https://www.youtube.com/watch?v=...")
+    url_b = cu2.text_input("動画B（バズ動画など）", key="cmp_b", placeholder="https://www.youtube.com/watch?v=...")
+
+    if st.button("⚔️ 比較する", key="cmp_btn") and url_a and url_b:
+        ida, idb = extract_video_id(url_a), extract_video_id(url_b)
+        if not ida or not idb:
+            st.error("URLからビデオIDを取得できませんでした。")
+        else:
+            with st.spinner("2本の動画を分析中..."):
+                try:
+                    va = fetch_video(ida); vb = fetch_video(idb)
+                    if not va or not vb:
+                        st.error("動画が見つかりません。"); st.stop()
+                    ba = fetch_channel_benchmark(va['channel_id'], ida)
+                    bb = fetch_channel_benchmark(vb['channel_id'], idb)
+                    ra = analyze(va, ba); rb = analyze(vb, bb)
+                except urllib.error.HTTPError:
+                    st.error("APIエラー（クォータ上限の可能性）"); st.stop()
+
+            ca, cb = st.columns(2)
+            for col, v_, r_, tag_ in [(ca, va, ra, "🅰️"), (cb, vb, rb, "🅱️")]:
+                with col:
+                    if v_['thumbnail_url']: st.image(v_['thumbnail_url'], use_container_width=True)
+                    g_, ge_ = grade_of(r_['total'])
+                    st.markdown(f"{tag_} **{v_['title'][:40]}**")
+                    st.caption(f"{v_['channel_title']}・登録者{v_['subscribers']:,}人")
+                    st.markdown(f"## {ge_} {r_['total']}点（{g_}）")
+                    st.metric("再生数", f"{v_['views']:,}")
+
+            st.divider()
+            st.subheader("📊 項目別の勝敗")
+            rows = []
+            wins_a = wins_b = 0
+            metric_pairs = [
+                ('総合スコア', ra['total'], rb['total'], '点'),
+                ('実績スコア', ra['perf_score'], rb['perf_score'], '点'),
+                ('パッケージスコア', ra['pack_score'], rb['pack_score'], '点'),
+                ('再生数', va['views'], vb['views'], '回'),
+                ('日次再生', round(ra['views_per_day']), round(rb['views_per_day']), '回/日'),
+                ('いいね率', round(ra['like_rate'], 1), round(rb['like_rate'], 1), '%'),
+                ('コメント率', round(ra['comment_rate'], 2), round(rb['comment_rate'], 2), '%'),
+            ]
+            for name, a_val, b_val, unit in metric_pairs:
+                if a_val > b_val: w = "🅰️"; wins_a += 1
+                elif b_val > a_val: w = "🅱️"; wins_b += 1
+                else: w = "🤝"
+                rows.append({'項目': name, '動画A': f"{a_val:,}{unit}", '動画B': f"{b_val:,}{unit}", '勝者': w})
+            for k in ra['scores']:
+                a_s, b_s = ra['scores'][k], rb['scores'].get(k, 0)
+                if a_s > b_s: w = "🅰️"; wins_a += 1
+                elif b_s > a_s: w = "🅱️"; wins_b += 1
+                else: w = "🤝"
+                rows.append({'項目': k, '動画A': f"{a_s}/10", '動画B': f"{b_s}/10", '勝者': w})
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+            st.subheader("🏆 結論")
+            if wins_a > wins_b:
+                st.markdown(f'<div class="win-box">動画Aの勝ち（{wins_a}勝{wins_b}敗）。動画Bが勝っている項目が動画Aの改善ヒント。</div>', unsafe_allow_html=True)
+            elif wins_b > wins_a:
+                st.markdown(f'<div class="win-box">動画Bの勝ち（{wins_b}勝{wins_a}敗）。動画Bが勝っている項目（特にパッケージ系）を自分の動画に取り入れるのが近道。</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="win-box">引き分け（{wins_a}勝{wins_b}敗）。項目別の差分を見て弱点を補強しよう。</div>', unsafe_allow_html=True)
+
+# ────────────────────────────────────────────────────────
+# タブ3：チャンネル分析
+# ────────────────────────────────────────────────────────
+with tab3:
+    st.title("📺 チャンネル分析")
+    st.caption("チャンネルの直近動画を一括分析し、勝ちパターンを抽出します。")
+
+    ch_input = st.text_input("チャンネルURL・@ハンドル・動画URLのどれでもOK", key="ch_input",
+                             placeholder="https://www.youtube.com/@チャンネル名")
+
+    if st.button("📺 チャンネルを分析する", key="ch_btn") and ch_input:
+        with st.spinner("チャンネル情報取得中..."):
+            ch = resolve_channel(ch_input)
+        if not ch:
+            st.error("チャンネルが見つかりませんでした。")
+        else:
+            with st.spinner("直近動画を取得中..."):
+                vids = fetch_channel_videos(ch['id'])
+            if not vids:
+                st.error("動画が取得できませんでした。")
+            else:
+                st.markdown(f"### {ch['title']}")
+                cm1, cm2, cm3, cm4 = st.columns(4)
+                cm1.metric("登録者", f"{ch['subscribers']:,}人")
+                cm2.metric("総動画数", f"{ch['total_videos']:,}本")
+                cm3.metric("総再生数", f"{ch['total_views']:,}回")
+                med_views = _median([x['views'] for x in vids])
+                cm4.metric("直近の中央値", f"{med_views:,.0f}回")
+
+                st.divider()
+
+                # ── 動画テーブル ──
+                st.subheader(f"📋 直近{len(vids)}本の成績表")
+                table = []
+                for x in sorted(vids, key=lambda a: -a['views']):
+                    rel = x['views'] / med_views if med_views > 0 else 0
+                    fire = "🔥" if rel >= 2 else ("✅" if rel >= 1 else "▫️")
+                    table.append({
+                        '': fire,
+                        'タイトル': x['title'][:38],
+                        '再生数': f"{x['views']:,}",
+                        '中央値比': f"{rel:.1f}倍",
+                        'いいね率': f"{x['lr']:.1f}%",
+                        '長さ': f"{x['duration']//60}分",
+                        '投稿': x['published'],
+                    })
+                st.dataframe(table, use_container_width=True, hide_index=True)
+
+                # ── 勝ちパターン抽出 ──
+                if len(vids) >= 6:
+                    st.subheader("🏆 勝ちパターン分析(上位3本 vs 下位3本)")
+                    ranked = sorted(vids, key=lambda a: -a['views'])
+                    top3, bottom3 = ranked[:3], ranked[-3:]
+
+                    def traits(group):
+                        return {
+                            'len': sum(len(x['title']) for x in group) / len(group),
+                            'num': sum(1 for x in group if re.search(r'\d', x['title'])) / len(group) * 100,
+                            'emo': sum(1 for x in group if emotional_count_of(x['title']) >= 1) / len(group) * 100,
+                            'dur': _median([x['duration'] for x in group]) / 60,
+                            'lr': _median([x['lr'] for x in group]),
+                        }
+                    tt, tb = traits(top3), traits(bottom3)
+
+                    comp = [
+                        {'特徴': 'タイトル文字数', '🔥上位3本': f"{tt['len']:.0f}文字", '▫️下位3本': f"{tb['len']:.0f}文字"},
+                        {'特徴': '数字入りタイトル率', '🔥上位3本': f"{tt['num']:.0f}%", '▫️下位3本': f"{tb['num']:.0f}%"},
+                        {'特徴': '感情トリガー使用率', '🔥上位3本': f"{tt['emo']:.0f}%", '▫️下位3本': f"{tb['emo']:.0f}%"},
+                        {'特徴': '動画の長さ（中央値）', '🔥上位3本': f"{tt['dur']:.0f}分", '▫️下位3本': f"{tb['dur']:.0f}分"},
+                        {'特徴': 'いいね率（中央値）', '🔥上位3本': f"{tt['lr']:.1f}%", '▫️下位3本': f"{tb['lr']:.1f}%"},
+                    ]
+                    st.dataframe(comp, use_container_width=True, hide_index=True)
+
+                    insights = []
+                    if tt['num'] > tb['num'] + 20:
+                        insights.append("数字入りタイトルの動画が伸びている → 次の動画も必ず数字を入れる")
+                    if tt['emo'] > tb['emo'] + 20:
+                        insights.append("感情トリガー入りタイトルが伸びている → 驚き・恐怖・欲求・共感ワードを使い続ける")
+                    if abs(tt['dur'] - tb['dur']) >= 3:
+                        direction = "長め" if tt['dur'] > tb['dur'] else "短め"
+                        insights.append(f"伸びている動画は{direction}（約{tt['dur']:.0f}分）→ この長さに寄せる")
+                    if tt['len'] > tb['len'] + 8:
+                        insights.append(f"伸びている動画はタイトルが長め（約{tt['len']:.0f}文字）→ 情報量を増やす")
+                    elif tb['len'] > tt['len'] + 8:
+                        insights.append(f"伸びている動画はタイトルが短め（約{tt['len']:.0f}文字）→ 簡潔で強い言葉に絞る")
+                    hours = Counter(x['hour_jst'] for x in top3)
+                    best_hour = hours.most_common(1)[0][0] if hours else None
+                    if best_hour is not None:
+                        insights.append(f"上位動画に多い投稿時間はJST {best_hour}時台 → 次回も同じ時間帯を狙う")
+
+                    if insights:
+                        st.markdown("**📌 このチャンネルの勝ちパターン：**")
+                        for ins in insights:
+                            st.markdown(f'<div class="win-box">💡 {ins}</div>', unsafe_allow_html=True)
+                    else:
+                        st.info("上位と下位で明確なパターン差は見つかりませんでした。テーマ自体の差が大きい可能性があります。")
+                else:
+                    st.info("動画本数が少ないため勝ちパターン分析はスキップしました（6本以上で有効）。")
