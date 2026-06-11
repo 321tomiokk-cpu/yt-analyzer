@@ -101,14 +101,8 @@ def fetch_channel_benchmark(channel_id, exclude_id, max_results=25):
     """チャンネルの直近動画からベンチマーク統計を計算（外れ値に強い中央値ベース）"""
     from datetime import timezone
     try:
-        search_data = yt_api('search', {
-            'part': 'id', 'channelId': channel_id,
-            'order': 'date', 'type': 'video', 'maxResults': max_results
-        })
-        if not search_data.get('items'):
-            return None
-        video_ids = [item['id']['videoId'] for item in search_data['items']
-                     if item['id'].get('videoId') != exclude_id]
+        all_ids = fetch_recent_video_ids(channel_id, max_results)
+        video_ids = [i for i in all_ids if i != exclude_id]
         if not video_ids:
             return None
         vdata = yt_api('videos', {
@@ -171,24 +165,60 @@ def fetch_comments(video_id, max_results=50):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_channel(s):
-    """チャンネルURL・@ハンドル・動画URLからチャンネルIDと基本情報を取得"""
+    """チャンネルURL・@ハンドル・動画URL・チャンネル名からチャンネルIDと基本情報を取得"""
     try:
+        # URLエンコードされた日本語ハンドル（%E3%83…）をデコード
+        s = urllib.parse.unquote(s.strip())
+        d = None
+
+        # ① /channel/UCxxxx 形式
         m = re.search(r'channel/(UC[\w-]{22})', s)
         if m:
-            cid = m.group(1)
-            d = yt_api('channels', {'part': 'snippet,statistics', 'id': cid})
-        else:
+            d = yt_api('channels', {'part': 'snippet,statistics', 'id': m.group(1)})
+
+        # ② 動画URL → そのチャンネル
+        if not (d and d.get('items')):
             vid = extract_video_id(s)
             if vid:
                 vd = yt_api('videos', {'part': 'snippet', 'id': vid})
-                if not vd.get('items'): return None
-                cid = vd['items'][0]['snippet']['channelId']
-                d = yt_api('channels', {'part': 'snippet,statistics', 'id': cid})
+                if vd.get('items'):
+                    cid = vd['items'][0]['snippet']['channelId']
+                    d = yt_api('channels', {'part': 'snippet,statistics', 'id': cid})
+
+        # ③ @ハンドル（日本語・記号含む）
+        if not (d and d.get('items')):
+            m = re.search(r'@([^/?&\s]+)', s)
+            if m:
+                try:
+                    d = yt_api('channels', {'part': 'snippet,statistics', 'forHandle': '@' + m.group(1)})
+                except Exception:
+                    d = None
+
+        # ④ 旧形式 /user/名前
+        if not (d and d.get('items')):
+            m = re.search(r'/user/([^/?&\s]+)', s)
+            if m:
+                try:
+                    d = yt_api('channels', {'part': 'snippet,statistics', 'forUsername': m.group(1)})
+                except Exception:
+                    d = None
+
+        # ⑤ 最終手段：チャンネル名で検索（/c/カスタムURL・名前だけの入力に対応）
+        if not (d and d.get('items')):
+            name = s
+            m = re.search(r'/c/([^/?&\s]+)', s)
+            if m:
+                name = m.group(1)
             else:
-                m = re.search(r'@([\w.\-ぁ-んァ-ヶ一-龥ー]+)', s)
-                if not m: return None
-                d = yt_api('channels', {'part': 'snippet,statistics', 'forHandle': '@' + m.group(1)})
-        if not d.get('items'): return None
+                name = re.sub(r'https?://[^\s]*?(youtube\.com|youtu\.be)/?', '', name).strip()
+            name = name.lstrip('@').strip()
+            if name:
+                sr = yt_api('search', {'part': 'snippet', 'q': name, 'type': 'channel', 'maxResults': 1})
+                if sr.get('items'):
+                    cid = sr['items'][0]['snippet']['channelId']
+                    d = yt_api('channels', {'part': 'snippet,statistics', 'id': cid})
+
+        if not (d and d.get('items')): return None
         c = d['items'][0]
         return {
             'id': c['id'],
@@ -201,16 +231,38 @@ def resolve_channel(s):
         return None
 
 
+def fetch_recent_video_ids(channel_id, max_results=25):
+    """直近動画IDの取得。uploadsプレイリスト方式（1ユニット）を優先し、
+    失敗時のみsearch（100ユニット）にフォールバック"""
+    ids = []
+    try:
+        if channel_id.startswith('UC'):
+            uploads_pid = 'UU' + channel_id[2:]
+            d = yt_api('playlistItems', {
+                'part': 'contentDetails', 'playlistId': uploads_pid,
+                'maxResults': min(50, max_results)
+            })
+            ids = [i['contentDetails']['videoId'] for i in d.get('items', [])]
+    except Exception:
+        ids = []
+    if not ids:
+        try:
+            sd = yt_api('search', {
+                'part': 'id', 'channelId': channel_id,
+                'order': 'date', 'type': 'video', 'maxResults': max_results
+            })
+            ids = [i['id']['videoId'] for i in sd.get('items', []) if i['id'].get('videoId')]
+        except Exception:
+            ids = []
+    return ids
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_channel_videos(channel_id, max_results=25):
     """チャンネル分析用：直近動画の詳細リスト"""
     from datetime import timezone
     try:
-        search_data = yt_api('search', {
-            'part': 'id', 'channelId': channel_id,
-            'order': 'date', 'type': 'video', 'maxResults': max_results
-        })
-        ids = [i['id']['videoId'] for i in search_data.get('items', []) if i['id'].get('videoId')]
+        ids = fetch_recent_video_ids(channel_id, max_results)
         if not ids: return []
         vdata = yt_api('videos', {'part': 'snippet,statistics,contentDetails', 'id': ','.join(ids[:25])})
         now = datetime.now(timezone.utc)
