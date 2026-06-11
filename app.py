@@ -1547,6 +1547,61 @@ with tab2:
             else:
                 st.markdown(f'<div class="win-box">引き分け（{wins_a}勝{wins_b}敗）。項目別の差分を見て弱点を補強しよう。</div>', unsafe_allow_html=True)
 
+            # ── 負けた動画の詳細改善プラン ──
+            if (ra['total'], wins_a) >= (rb['total'], wins_b):
+                win_v, win_r, win_tag = va, ra, "🅰️ 動画A"
+                lose_v, lose_r, lose_tag = vb, rb, "🅱️ 動画B"
+            else:
+                win_v, win_r, win_tag = vb, rb, "🅱️ 動画B"
+                lose_v, lose_r, lose_tag = va, ra, "🅰️ 動画A"
+
+            st.divider()
+            st.subheader(f"🛠️ {lose_tag} の改善プラン（{win_tag} に追いつくには）")
+            st.caption(f"対象：{lose_v['title'][:50]}")
+
+            # ① 差が大きいカテゴリから順に提示
+            gaps = []
+            for k in lose_r['scores']:
+                diff = win_r['scores'].get(k, 0) - lose_r['scores'][k]
+                if diff > 0:
+                    gaps.append((k, lose_r['scores'][k], win_r['scores'].get(k, 0), diff))
+            gaps.sort(key=lambda x: -x[3])
+
+            if gaps:
+                st.markdown("**📊 差がついているカテゴリ（差が大きい順）── ここを直すのが最短ルート：**")
+                gap_rows = [{'カテゴリ': k, lose_tag: f"{ls}/10", win_tag: f"{ws}/10", '差': f"-{diff}点"}
+                            for k, ls, ws, diff in gaps]
+                st.dataframe(gap_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("カテゴリ別では負けている項目がありません。実績（再生数）の差が主な要因です。")
+
+            # ② 最優先で直すこと
+            if lose_r['critical']:
+                st.markdown("**🚨 最優先で直すこと：**")
+                for c in lose_r['critical']:
+                    st.markdown(f'<div class="critical-box">❌ {c}</div>', unsafe_allow_html=True)
+
+            # ③ 具体的な改善手順（YouTube Studioの操作場所付き）
+            if lose_r['impr']:
+                st.markdown("**💡 具体的な改善手順（優先順・YouTube Studioの操作場所付き）：**")
+                for i, imp in enumerate(lose_r['impr'], 1):
+                    st.markdown(f'<div class="impr-box"><strong>#{i}</strong>　{imp}</div>', unsafe_allow_html=True)
+
+            # ④ 負けた動画のパターンチェックで❌だった項目の直し方
+            lose_fails = [p for p in lose_r.get('patterns', []) if p['met'] is False and p.get('fix')]
+            if lose_fails:
+                st.markdown("**🔍 バズるパターンで未達成の項目と直し方：**")
+                for p in lose_fails:
+                    with st.expander(f"❌ {p['label']} ── {p['why']}"):
+                        st.markdown(p['fix'])
+
+            # ⑤ 勝った動画から盗めるポイント
+            copyable = win_r['good'][:8]
+            if copyable:
+                st.markdown(f"**🏆 {win_tag} から盗めるポイント（勝者がやれていること）：**")
+                for g_item in copyable:
+                    st.markdown(f'<div class="win-box">✅ {g_item}</div>', unsafe_allow_html=True)
+
 # ────────────────────────────────────────────────────────
 # タブ3：チャンネル分析
 # ────────────────────────────────────────────────────────
